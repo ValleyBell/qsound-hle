@@ -322,14 +322,14 @@ static void update_sample(struct qsound_chip *chip)
 		default:
 		case STATE_INIT1:
 		case STATE_INIT2:
-			return state_init(chip);
+			state_init(chip); return;
 		case STATE_REFRESH1:
-			return state_refresh_filter_1(chip);
+			state_refresh_filter_1(chip); return;
 		case STATE_REFRESH2:
-			return state_refresh_filter_2(chip);
+			state_refresh_filter_2(chip); return;
 		case STATE_NORMAL1:
 		case STATE_NORMAL2:
-			return state_normal_update(chip);
+			state_normal_update(chip); return;
 	}
 }
 
