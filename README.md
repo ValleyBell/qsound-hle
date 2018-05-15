@@ -14,7 +14,9 @@ The DSP program was written by Brian Schmidt and shares similarities (such as th
   The code originates from [libvgm](https://github.com/ValleyBell/libvgm/) and was slightly modified in order to remove libvgm-dependencies.
 - qsound\_vb.c/h
   New emulator written from scratch by ctr. Designed to be fast and produce accurate output.
-
+- patents/
+  The original QSound patents. Contains interesting information on the algorithms. They should have expired by now.
+  
 ## Notes
 - There is no known game that uses the ADPCM channels.
 - The QSound program supports two different modes. The second mode features an additional filter. No game is known to use the second mode.
