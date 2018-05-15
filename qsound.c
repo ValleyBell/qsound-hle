@@ -7,8 +7,6 @@
 	with thanks to Valley Bell
 
 	2018-05-12 - 2018-05-15
-	
-	See LICENSE for licensing details.
 
 */
 
@@ -590,9 +588,13 @@ static void state_normal_update(struct qsound_chip *chip)
 		
 		for(int v=0; v<19; v++)
 		{
+			uint16_t pan_index = chip->voice_pan[v]-0x110;
+			if(pan_index > 97)
+				pan_index = 97;
+			
 			// Apply different volume tables on the dry and wet inputs.
-			dry -= (chip->voice_output[v] * chip->pan_tables[ch][PANTBL_DRY][chip->voice_pan[v]-0x110])<<2;
-			wet -= (chip->voice_output[v] * chip->pan_tables[ch][PANTBL_WET][chip->voice_pan[v]-0x110])<<2;
+			dry -= (chip->voice_output[v] * chip->pan_tables[ch][PANTBL_DRY][pan_index])<<2;
+			wet -= (chip->voice_output[v] * chip->pan_tables[ch][PANTBL_WET][pan_index])<<2;
 		}
 		
 		// Apply FIR filter on 'wet' input
