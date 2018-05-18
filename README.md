@@ -3,7 +3,7 @@
 This repository contains various files that were used in order to make a proper high-level emulator for Capcom QSound.
 
 The QSound chip (labelled DL-1425) consists of a DSP16A digital signal processor with a mask-programmed ROM. It was used commonly in Capcom's CP System II system.   
-It supports playback of 16 PCM channels (loopable) and 3 ADPCM channels (one-shot). It supports FIR filters and echo to enhence sound quality.
+It supports playback of 16 PCM channels (loopable) and 3 ADPCM channels (one-shot). It supports FIR filters and echo to enhance sound quality.
 The DSP program was written by Brian Schmidt and shares similarities (such as the ADPCM algorithm) with his other famous DSP, the BSMT2000.
 
 ## Files
@@ -12,7 +12,7 @@ The DSP program was written by Brian Schmidt and shares similarities (such as th
 - old/qsound\_vb.c/h
   A pretty straight port of the QSound program to C. Reference offsets of the original program ROM are noted in comments.  
   The code originates from [libvgm](https://github.com/ValleyBell/libvgm/) and was slightly modified in order to remove libvgm-dependencies.
-- qsound\_vb.c/h
+- qsound.c/h
   New emulator written from scratch by ctr. Designed to be fast and produce accurate output.
 - patents/
   The original QSound patents. Contains interesting information on the algorithms. They should have expired by now.

@@ -1,6 +1,9 @@
-// QSound sound emulation
-// Valley Bell, 2018
+// QSound DL-1425 emulation
+// ------------------------
+// Valley Bell, May 2018
 // ported from a disassembly of the QSound DSP program ROM dl-1425.bin
+//
+// Thanks to superctr for documenting all the RAM offsets.
 #include <stdlib.h>
 #include <string.h>	// for memset
 
@@ -37,17 +40,19 @@ INLINE INT32 DSP_ROUND(INT32 value);
 static void dsp_do_update_step(QSOUND_CHIP* chip);
 static void dsp_update_delay(QSOUND_CHIP* chip);
 static void dsp_update_test(QSOUND_CHIP* chip);	// ROM: 0018
-static void dsp_copy_filter_data_1(QSOUND_CHIP* chip);	// ROM: 0039
-static void dsp_copy_filter_data_2(QSOUND_CHIP* chip);	// ROM: 004F
-static void dsp_init1(QSOUND_CHIP* chip);	// ROM: 0288
-static void dsp_init2(QSOUND_CHIP* chip);	// ROM: 061A
-static void dsp_filter_recalc(QSOUND_CHIP* chip, UINT16 refreshFlagAddr);	// ROM: 05DD / 099B
-static void dsp_update_1(QSOUND_CHIP* chip);	// ROM: 0314
-static void dsp_update_2(QSOUND_CHIP* chip);	// ROM: 06B2
-static void dsp_filter_a(QSOUND_CHIP* chip, UINT16 i1);	// ROM: 0314/036F/03CA
-static void dsp_filter_b(QSOUND_CHIP* chip, UINT16 i1);	// ROM: 0425/0470/04B4
+static void dsp_copy_mode1_fir_data(QSOUND_CHIP* chip);	// ROM: 0039
+static void dsp_copy_mode2_fir_data(QSOUND_CHIP* chip);	// ROM: 004F
+static void dsp_mode1_init(QSOUND_CHIP* chip);	// ROM: 0288
+static void dsp_mode2_init(QSOUND_CHIP* chip);	// ROM: 061A
+static void dsp_recalculate_delay(QSOUND_CHIP* chip, UINT16 refreshFlagAddr);	// ROM: 05DD / 099B
+static void dsp_update_mode_1(QSOUND_CHIP* chip);	// ROM: 0314
+static void dsp_update_mode_2(QSOUND_CHIP* chip);	// ROM: 06B2
+static void dsp_update_adpcm(QSOUND_CHIP* chip, UINT8 chn, UINT8 nibble);
+static void dsp_update_pcm(QSOUND_CHIP* chip);	// ROM: 050A/08A8
 static void dsp_sample_calc_1(QSOUND_CHIP* chip);	// ROM: 0504
 static void dsp_sample_calc_2(QSOUND_CHIP* chip);	// ROM: 08A2
+static void dsp_sample_speaker_calc_1(QSOUND_CHIP* chip, UINT8 spkr, INT32 a1);	// ROM: 0572/05A9
+static void dsp_sample_speaker_calc_2(QSOUND_CHIP* chip, UINT8 spkr, INT32 a1);	// ROM: 0910/0957
 
 
 typedef void (*UPDATE_FUNC)(QSOUND_CHIP* chip);
@@ -69,7 +74,7 @@ struct qsound_chip
 	UINT8 dspRtStep;	// each routine outputs 6 samples before restarting, this indicates the current sample
 	UPDATE_FUNC updateFunc;
 	
-	UINT16 muteMask;
+	UINT32 muteMask;
 };
 
 
@@ -91,46 +96,105 @@ struct qsound_chip
 
 
 // ---- RAM offsets ----
-#define OFS_CHANNEL_MEM		0x000	// 000-07F, 16 channels, 8 bytes per channel
-#define OFS_CH_BANK			0x000
-#define OFS_CH_CUR_ADDR		0x001
-#define OFS_CH_RATE			0x002
-#define OFS_CH_FRAC			0x003
-#define OFS_CH_LOOP_LEN		0x004
-#define OFS_CH_END_ADDR		0x005
-#define OFS_CH_VOLUME		0x006
+#define OFS_CHANNEL_MEM		0x000	// 000-07F, 16 channels, 8 words per channel
+	#define OFS_CH_BANK			0x000
+	#define OFS_CH_CUR_ADDR		0x001
+	#define OFS_CH_RATE			0x002
+	#define OFS_CH_FRAC			0x003
+	#define OFS_CH_LOOP_LEN		0x004
+	#define OFS_CH_END_ADDR		0x005
+	#define OFS_CH_VOLUME		0x006
 #define OFS_PAN_POS			0x080	// 080-092, 16+3 channels, offset into DSP ROM pan table for left speaker
-#define OFS_REVERB_VOL		0x093
+#define OFS_REVERB_FB_VOL	0x093	// Reverb feedback volume
+// 094-0B9 are unused
 #define OFS_CH_REVERB		0x0BA	// 0BA-0C9, 16 channels
-#define OFS_DELAYBUF_END	0x0D9
-#define OFS_FILTER_REFRESH	0x0E2	// set to 1 to request recalculation of filter data
+
+#define OFS_ADPCM_ST_ADDR	0x0CA	// 0CA-0D5, 3 ADPCM channels, 4 words per channel
+#define OFS_ADPCM_END_ADDR	0x0CB
+#define OFS_ADPCM_BANK		0x0CC
+#define OFS_ADPCM_VOLUME	0x0CD
+#define OFS_ADPCM_CH_PLAY	0x0D6	// 0D6-0D8, 3 ADPCM channels, non-zero value starts ADPCM playback
+
+#define OFS_DELAYBUF_END	0x0D9	// subtract with OFS_Mx_DELAY_BUF for reverb delay length
+
+#define OFS_FIR_LPOS		0x0DA	// left filter A select
+#define OFS_FIR1_LPOS		OFS_FIR_LPOS
+#define OFS_FIR2_LPOS		0x0DB	// left filter B select
+#define OFS_FIR_RPOS		0x0DC	// right filter A select
+#define OFS_FIR1_RPOS		OFS_FIR_RPOS
+#define OFS_FIR2_RPOS		0x0DD	// right filter B select
+#define OFS_WET_LDELAY		0x0DE	// left filtered phase delay
+#define OFS_DRY_LDELAY		0x0DF	// left raw phase delay
+#define OFS_WET_RDELAY		0x0E0	// right filtered phase delay
+#define OFS_DRY_RDELAY		0x0E1	// right raw phase delay
+
+#define OFS_DELAY_REFRESH	0x0E2	// set to 1 to request recalculation of wet/dry delay
 #define OFS_ROUTINE			0x0E3	// offset of DSP ROM sample processing routine
+
+#define OFS_WET_LVOL		0x0E4	// volume for left speaker filtered part
+#define OFS_DRY_LVOL		0x0E5	// volume for left speaker unfiltered part
+#define OFS_WET_RVOL		0x0E6	// volume for right speaker filtered part
+#define OFS_DRY_RVOL		0x0E7	// volume for right speaker unfiltered part
+
+// **** End of Z80 communication registers ***
+
+#define OFS_ADPCM_CUR_VOL	0x0E8	// 0E8-0EA, 3 channels
+#define OFS_ADPCM_SIGNAL	0x0EB	// 0EB-0EE, 3 channels
+#define OFS_ADPCM_CUR_ADDR	0x0F1	// 0F1-0F3, 3 channels
+#define OFS_ADPCM_STEP		0x0F4	// 0F4-0F6, 3 channels
+
 #define OFS_PAN_RPOS		0x0F7	// 0F7-109, 16+3 channels, offset cache for right speaker (== RAM[OFS_PAN_POS]+2*98)
 #define OFS_CH_SMPLDATA		0x10A	// 10A-11C, 16+3 channels, caches (sampleData * channelVolume)
+#define OFS_ACH_SMPLDATA	0x11A	// ADPCM data
+
+#define OFS_RAW_OUT			0x11E	// raw / non filtered output
+
 #define OFS_DELAYBUF_POS	0x11F
+#define OFS_REV_OUTBUF_POS	0x120	// position of some delay buffer for the reverb output
+#define OFS_REVERB_OUTPUT	0x121
+#define OFS_REVERB_LASTSAMP	0x122	// Last value from the filter buffer, used to smooth the reverb output
 
-#define OFS_BUF_12D			0x12D
-#define OFS_BUF_160			0x160
-#define OFS_BUF_193			0x193
-#define OFS_BUF_1C6			0x1C6
+#define OFS_FIR_LBPOS		0x123	// ring buffer position, left channel
+#define OFS_FIR_RBPOS		0x124	// ring buffer position, right channel
+#define OFS_WET_LBUF_W		0x125	// write pointer
+#define OFS_WET_LBUF_R		0x126	// read pointer
+#define OFS_DRY_LBUF_W		0x127	// write pointer
+#define OFS_DRY_LBUF_R		0x128	// read pointer
+#define OFS_WET_RBUF_W		0x129	// write pointer
+#define OFS_WET_RBUF_R		0x12A	// read pointer
+#define OFS_DRY_RBUF_W		0x12B	// write pointer
+#define OFS_DRY_RBUF_R		0x12C	// read pointer
 
-#define OFS_M1_BUF_1F9		0x1F9
-#define OFS_M1_BUF_257		0x257
-#define OFS_M1_FILTER1_TBL	0x2B5
-#define OFS_M1_FILTER2_TBL	0x314
-#define OFS_M1_BUF_373		0x373
-#define OFS_M1_DELAY_BUFFER	0x554
+#define DW_BUF_SIZE		0x033		// dry/wet buffer size
+#define OFS_WET_LBUF		0x12D	// 12D-15F, delay line for left filtered output
+#define OFS_DRY_LBUF		0x160	// 160-192, delay line for left unfiltered output
+#define OFS_WET_RBUF		0x193	// 193-1C5, delay line for left filtered output
+#define OFS_DRY_RBUF		0x1C6	// 1C6-1F8, delay line for left unfiltered output
+#define OFS_WET_LBEND		(OFS_WET_LBUF + DW_BUF_SIZE - 1)
+#define OFS_DRY_LBEND		(OFS_DRY_LBUF + DW_BUF_SIZE - 1)
+#define OFS_WET_RBEND		(OFS_WET_RBUF + DW_BUF_SIZE - 1)
+#define OFS_DRY_RBEND		(OFS_DRY_RBUF + DW_BUF_SIZE - 1)
 
-#define OFS_M2_BUF_1FB		0x1FB
-#define OFS_M2_BUF_227		0x227
-#define OFS_M2_BUF_253		0x253
-#define OFS_M2_BUF_27E		0x27E
-#define OFS_M2_FILTER1A_TBL	0x2A9
-#define OFS_M2_FILTER1B_TBL	0x2D6
-#define OFS_M2_FILTER2A_TBL	0x302
-#define OFS_M2_FILTER2B_TBL	0x32F
-#define OFS_M2_BUF_35B		0x35B
-#define OFS_M2_DELAY_BUFFER	0x53C
+#define OFS_M1_FIR_LBUF		0x1F9	// 1F9-256, tapped delay line for the left channel FIR filter
+#define OFS_M1_FIR_RBUF		0x257	// 257-2B4, tapped delay line for the right channel FIR filter
+#define OFS_M1_FIR_LTBL		0x2B5	// 2B5-313, coefficients for the left channel FIR filter
+#define OFS_M1_FIR_RTBL		0x314	// 314-372, coefficients for the right channel FIR filter
+#define OFS_M1_REV_OUTBUF	0x373	// 373-553, reverb output buffer. Only written to, never read ?
+#define OFS_M1_DELAY_BUF	0x554	// 554-7FF
+
+// for mode 2, the "unfiltered" output actually goes through another filter.
+#define OFS_M2_FIR2_LBPOS	0x1F9	// ring buffer position
+#define OFS_M2_FIR2_RBPOS	0x1FA	// used for the second filter
+#define OFS_M2_FIR1_LBUF	0x1FB	// 1FB-226
+#define OFS_M2_FIR1_RBUF	0x227	// 227-252
+#define OFS_M2_FIR2_LBUF	0x253	// 253-27D
+#define OFS_M2_FIR2_RBUF	0x27E	// 27E-2A8
+#define OFS_M2_FIR1_LTBL	0x2A9	// 2A9-2D5
+#define OFS_M2_FIR2_LTBL	0x2D6	// 2D6-301
+#define OFS_M2_FIR1_RTBL	0x302	// 302-32E
+#define OFS_M2_FIR2_RTBL	0x32F	// 32F-35A
+#define OFS_M2_REV_OUTBUF	0x35B	// 35B-53B
+#define OFS_M2_DELAY_BUF	0x53C	// 53C-7FF
 
 
 // ---- lookup tables ----
@@ -208,18 +272,17 @@ static const INT16 PAN_TABLES[4][0x62] =
 
 static const INT16 LUT_09D2[] =
 {	// ROM: 09D2
-	0x0000, 0x3305, 0xFDC3, 0x023D, 0xC6B7, 0x778A, 0xFB86, 0x047A, 0x04F0, 0x0000
+	0, 13061, -573, 573, -14665, 30602, -1146, 1146, 1264, 0
 };
 
-static const INT16 LUT_09DC[] =
+static const INT16 LUT_ADPCM_SHIFT[] =
 {	// ROM: 09DC
-	0x009A, 0x009A, 0x0080, 0x0066, 0x004D, 0x003A, 0x003A, 0x003A,
+	154, 154, 128, 102,  77,  58,  58,  58,
 	// ROM: 09E4
-	0x003A, 0x003A, 0x003A, 0x003A, 0x004D, 0x0066, 0x0080, 0x009A,
-	0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000
+	 58,  58,  58,  58,  77, 102, 128, 154
 };
 
-static const INT16 FILTER_LUT_MODE1[5][95] =
+static const INT16 FILTER_LUT_MODE1[6][95] =
 {
 	{	// ROM: 0D53
 		0x0000, 0x0000, 0x0000, 0x0006, 0x002C, 0xFFE8, 0xFFCB, 0xFFF6,
@@ -290,6 +353,20 @@ static const INT16 FILTER_LUT_MODE1[5][95] =
 		0x0011, 0x001D, 0x001D, 0xFFFE, 0xFFB4, 0xFF64, 0xFF45, 0xFF69,
 		0xFFAB, 0xFFE1, 0xFFFB, 0x0007, 0x0014, 0x0020, 0x0018, 0xFFFB,
 		0xFFEC, 0x0006, 0x0030, 0x003E, 0x0000, 0x0000, 0x0000
+	},
+	{	// ROM: 0F2E
+		0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+		0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+		0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+		0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+		0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+		0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+		0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+		0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+		0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+		0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+		0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+		0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000
 	}
 };
 
@@ -309,7 +386,7 @@ static const INT16 FILTER_LUT_MODE2[95] =
 	0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
 	0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
 	0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
-	0x0000, 0x0000, 0x0000, 0x0000,
+	0x0000, 0x0000, 0x0000, 0xC000,
 	0x0000, 0x0000
 };
 
@@ -324,7 +401,7 @@ static const INT16* get_filter_table_1(UINT16 offset)
 	if ((offset % 95) > 0)
 		return NULL;
 	tblIdx = offset / 95;
-	if (tblIdx >= 5)
+	if (tblIdx >= 6)
 		return NULL;
 	return FILTER_LUT_MODE1[tblIdx];	// return beginning of one of the tables
 }
@@ -376,10 +453,10 @@ static void dsp_do_update_step(QSOUND_CHIP* chip)
 		switch(chip->ram[OFS_ROUTINE])
 		{
 		case DSPRT_INIT1:
-			dsp_init1(chip);
+			dsp_mode1_init(chip);
 			break;
 		case DSPRT_INIT2:
-			dsp_init2(chip);
+			dsp_mode2_init(chip);
 			break;
 		case DSPRT_DO_TEST1:	// ROM: 000C
 			chip->testInc = 0x0001;
@@ -390,19 +467,19 @@ static void dsp_do_update_step(QSOUND_CHIP* chip)
 			chip->ram[OFS_ROUTINE] = DSPRT_TEST;
 			break;
 		case DSPRT_DO_UPD1:
-			dsp_copy_filter_data_1(chip);
+			dsp_copy_mode1_fir_data(chip);
 			break;
 		case DSPRT_DO_UPD2:
-			dsp_copy_filter_data_2(chip);
+			dsp_copy_mode2_fir_data(chip);
 			break;
 		case DSPRT_TEST:
 			chip->updateFunc = dsp_update_test;
 			break;
 		case DSPRT_UPDATE1:
-			chip->updateFunc = dsp_update_1;
+			chip->updateFunc = dsp_update_mode_1;
 			break;
 		case DSPRT_UPDATE2:
-			chip->updateFunc = dsp_update_2;
+			chip->updateFunc = dsp_update_mode_2;
 			break;
 		default:	// handle invalid routines
 			chip->ram[OFS_ROUTINE] = DSPRT_INIT1;
@@ -447,45 +524,45 @@ static void dsp_update_test(QSOUND_CHIP* chip)	// ROM: 0018
 	return;
 }
 
-static void dsp_copy_filter_data_1(QSOUND_CHIP* chip)	// ROM: 0039
+static void dsp_copy_mode1_fir_data(QSOUND_CHIP* chip)	// ROM: 0039
 {
 	const INT16* filterTbl;
 	
-	filterTbl = get_filter_table_1(chip->ram[0x00DA]);
+	filterTbl = get_filter_table_1(chip->ram[OFS_FIR_LPOS]);
 	if (filterTbl != NULL)
-		memcpy(&chip->ram[OFS_M1_FILTER1_TBL], filterTbl, 95 * sizeof(INT16));
+		memcpy(&chip->ram[OFS_M1_FIR_LTBL], filterTbl, 95 * sizeof(INT16));
 	
-	filterTbl = get_filter_table_1(chip->ram[0x00DC]);
+	filterTbl = get_filter_table_1(chip->ram[OFS_FIR_RPOS]);
 	if (filterTbl != NULL)
-		memcpy(&chip->ram[OFS_M1_FILTER2_TBL], filterTbl, 95 * sizeof(INT16));
+		memcpy(&chip->ram[OFS_M1_FIR_RTBL], filterTbl, 95 * sizeof(INT16));
 	
 	chip->ram[OFS_ROUTINE] = DSPRT_UPDATE1;
 	return;
 }
 
-static void dsp_copy_filter_data_2(QSOUND_CHIP* chip)	// ROM: 004F
+static void dsp_copy_mode2_fir_data(QSOUND_CHIP* chip)	// ROM: 004F
 {
 	const INT16* filterTbl;
 	
-	filterTbl = get_filter_table_2(chip->ram[0x00DA]);
+	filterTbl = get_filter_table_2(chip->ram[OFS_FIR1_LPOS]);
 	if (filterTbl != NULL)
-		memcpy(&chip->ram[OFS_M2_FILTER1A_TBL], filterTbl, 45 * sizeof(INT16));
-	filterTbl = get_filter_table_2(chip->ram[0x00DB]);
+		memcpy(&chip->ram[OFS_M2_FIR1_LTBL], filterTbl, 45 * sizeof(INT16));
+	filterTbl = get_filter_table_2(chip->ram[OFS_FIR2_LPOS]);
 	if (filterTbl != NULL)
-		memcpy(&chip->ram[OFS_M2_FILTER1B_TBL], filterTbl, 44 * sizeof(INT16));
+		memcpy(&chip->ram[OFS_M2_FIR2_LTBL], filterTbl, 44 * sizeof(INT16));
 	
-	filterTbl = get_filter_table_2(chip->ram[0x00DC]);
+	filterTbl = get_filter_table_2(chip->ram[OFS_FIR1_RPOS]);
 	if (filterTbl != NULL)
-		memcpy(&chip->ram[OFS_M2_FILTER2A_TBL], filterTbl, 45 * sizeof(INT16));
-	filterTbl = get_filter_table_2(chip->ram[0x00DD]);
+		memcpy(&chip->ram[OFS_M2_FIR1_RTBL], filterTbl, 45 * sizeof(INT16));
+	filterTbl = get_filter_table_2(chip->ram[OFS_FIR2_RPOS]);
 	if (filterTbl != NULL)
-		memcpy(&chip->ram[OFS_M2_FILTER2B_TBL], filterTbl, 44 * sizeof(INT16));
+		memcpy(&chip->ram[OFS_M2_FIR2_RTBL], filterTbl, 44 * sizeof(INT16));
 	
 	chip->ram[OFS_ROUTINE] = DSPRT_UPDATE2;
 	return;
 }
 
-static void dsp_init1(QSOUND_CHIP* chip)	// ROM: 0288
+static void dsp_mode1_init(QSOUND_CHIP* chip)	// ROM: 0288
 {
 	UINT8 curChn;
 	
@@ -494,41 +571,41 @@ static void dsp_init1(QSOUND_CHIP* chip)	// ROM: 0288
 	
 	for (curChn = 0; curChn < 19; curChn ++)
 		chip->ram[OFS_PAN_POS + curChn] = 0x0120;	// pan = centre
-	chip->ram[0x0123] = OFS_M1_BUF_1F9;
-	chip->ram[0x0124] = OFS_M1_BUF_257;
-	chip->ram[0x0120] = OFS_M1_BUF_373;
-	chip->ram[OFS_DELAYBUF_POS] = OFS_M1_DELAY_BUFFER;
-	chip->ram[OFS_DELAYBUF_END] = OFS_M1_DELAY_BUFFER + 6;
-	chip->ram[0x0125] = OFS_BUF_12D;
-	chip->ram[0x0127] = OFS_BUF_160;
-	chip->ram[0x0129] = OFS_BUF_193;
-	chip->ram[0x012B] = OFS_BUF_1C6;
+	chip->ram[OFS_FIR_LBPOS] = OFS_M1_FIR_LBUF;
+	chip->ram[OFS_FIR_RBPOS] = OFS_M1_FIR_RBUF;
+	chip->ram[OFS_REV_OUTBUF_POS] = OFS_M1_REV_OUTBUF;
+	chip->ram[OFS_DELAYBUF_POS] = OFS_M1_DELAY_BUF;
+	chip->ram[OFS_DELAYBUF_END] = OFS_M1_DELAY_BUF + 6;
+	chip->ram[OFS_WET_LBUF_W] = OFS_WET_LBUF;
+	chip->ram[OFS_DRY_LBUF_W] = OFS_DRY_LBUF;
+	chip->ram[OFS_WET_RBUF_W] = OFS_WET_RBUF;
+	chip->ram[OFS_DRY_RBUF_W] = OFS_DRY_RBUF;
 	
-	chip->ram[0x00DE] = 0x0000;
-	chip->ram[0x00DF] = 0x002E;
-	chip->ram[0x00E0] = 0x0000;
-	chip->ram[0x00E1] = 0x0030;
-	dsp_filter_recalc(chip, OFS_FILTER_REFRESH);
-	chip->ram[0x00E4] = 0x3FFF;
-	chip->ram[0x00E5] = 0x3FFF;
-	chip->ram[0x00E6] = 0x3FFF;
-	chip->ram[0x00E7] = 0x3FFF;
+	chip->ram[OFS_WET_LDELAY] = 0x0000;
+	chip->ram[OFS_DRY_LDELAY] = 0x002E;
+	chip->ram[OFS_WET_RDELAY] = 0x0000;
+	chip->ram[OFS_DRY_RDELAY] = 0x0030;
+	dsp_recalculate_delay(chip, OFS_DELAY_REFRESH);
+	chip->ram[OFS_WET_LVOL] = 0x3FFF;
+	chip->ram[OFS_DRY_LVOL] = 0x3FFF;
+	chip->ram[OFS_WET_RVOL] = 0x3FFF;
+	chip->ram[OFS_DRY_RVOL] = 0x3FFF;
 	for (curChn = 0; curChn < 16; curChn ++)
 		chip->ram[OFS_CH_BANK + curChn * 0x08] = 0x8000;
 	
-	chip->ram[0x00CC] = 0x8000;
-	chip->ram[0x00D0] = 0x8000;
-	chip->ram[0x00D4] = 0x8000;
-	chip->ram[0x00DA] = 0x0DB2;
-	chip->ram[0x00DC] = 0x0E11;
+	chip->ram[OFS_ADPCM_BANK + 0x00] = 0x8000;
+	chip->ram[OFS_ADPCM_BANK + 0x04] = 0x8000;
+	chip->ram[OFS_ADPCM_BANK + 0x08] = 0x8000;
+	chip->ram[OFS_FIR_LPOS] = 0x0DB2;	// FILTER_LUT_MODE1[1]
+	chip->ram[OFS_FIR_RPOS] = 0x0E11;	// FILTER_LUT_MODE1[2]
 	
-	dsp_copy_filter_data_1(chip);
+	dsp_copy_mode1_fir_data(chip);
 	chip->dspRtStep = 4;
 	chip->updateFunc = dsp_update_delay;	// simulate the DSP being busy for 4 samples
 	return;
 }
 
-static void dsp_init2(QSOUND_CHIP* chip)	// ROM: 061A
+static void dsp_mode2_init(QSOUND_CHIP* chip)	// ROM: 061A
 {
 	UINT8 curChn;
 	
@@ -537,68 +614,68 @@ static void dsp_init2(QSOUND_CHIP* chip)	// ROM: 061A
 	
 	for (curChn = 0; curChn < 19; curChn ++)
 		chip->ram[OFS_PAN_POS + curChn] = 0x0120;	// pan = centre
-	chip->ram[0x0123] = OFS_M2_BUF_1FB;
-	chip->ram[0x0124] = OFS_M2_BUF_227;
-	chip->ram[0x01F9] = OFS_M2_BUF_253;
-	chip->ram[0x01FA] = OFS_M2_BUF_27E;
-	chip->ram[0x0120] = OFS_M2_BUF_35B;
-	chip->ram[OFS_DELAYBUF_POS] = OFS_M2_DELAY_BUFFER;
-	chip->ram[OFS_DELAYBUF_END] = OFS_M2_DELAY_BUFFER + 6;
-	chip->ram[0x0125] = OFS_BUF_12D;
-	chip->ram[0x0127] = OFS_BUF_160;
-	chip->ram[0x0129] = OFS_BUF_193;
-	chip->ram[0x012B] = OFS_BUF_1C6;
+	chip->ram[OFS_FIR_LBPOS] = OFS_M2_FIR1_LBUF;
+	chip->ram[OFS_FIR_RBPOS] = OFS_M2_FIR1_RBUF;
+	chip->ram[OFS_M2_FIR2_LBPOS] = OFS_M2_FIR2_LBUF;
+	chip->ram[OFS_M2_FIR2_RBPOS] = OFS_M2_FIR2_RBUF;
+	chip->ram[OFS_REV_OUTBUF_POS] = OFS_M2_REV_OUTBUF;
+	chip->ram[OFS_DELAYBUF_POS] = OFS_M2_DELAY_BUF;
+	chip->ram[OFS_DELAYBUF_END] = OFS_M2_DELAY_BUF + 6;
+	chip->ram[OFS_WET_LBUF_W] = OFS_WET_LBUF;
+	chip->ram[OFS_DRY_LBUF_W] = OFS_DRY_LBUF;
+	chip->ram[OFS_WET_RBUF_W] = OFS_WET_RBUF;
+	chip->ram[OFS_DRY_RBUF_W] = OFS_DRY_RBUF;
 	
-	chip->ram[0x00DE] = 0x0001;
-	chip->ram[0x00DF] = 0x0000;
-	chip->ram[0x00E0] = 0x0000;
-	chip->ram[0x00E1] = 0x0000;
-	dsp_filter_recalc(chip, OFS_FILTER_REFRESH);
-	chip->ram[0x00E4] = 0x3FFF;
-	chip->ram[0x00E5] = 0x3FFF;
-	chip->ram[0x00E6] = 0x3FFF;
-	chip->ram[0x00E7] = 0x3FFF;
+	chip->ram[OFS_WET_LDELAY] = 0x0001;
+	chip->ram[OFS_DRY_LDELAY] = 0x0000;
+	chip->ram[OFS_WET_RDELAY] = 0x0000;
+	chip->ram[OFS_DRY_RDELAY] = 0x0000;
+	dsp_recalculate_delay(chip, OFS_DELAY_REFRESH);
+	chip->ram[OFS_WET_LVOL] = 0x3FFF;
+	chip->ram[OFS_DRY_LVOL] = 0x3FFF;
+	chip->ram[OFS_WET_RVOL] = 0x3FFF;
+	chip->ram[OFS_DRY_RVOL] = 0x3FFF;
 	for (curChn = 0; curChn < 16; curChn ++)
 		chip->ram[OFS_CH_BANK + curChn * 0x08] = 0x8000;
 	
-	chip->ram[0x00CC] = 0x8000;
-	chip->ram[0x00D0] = 0x8000;
-	chip->ram[0x00D4] = 0x8000;
-	chip->ram[0x00DA] = 0x0F73;
-	chip->ram[0x00DB] = 0x0FA4;
-	chip->ram[0x00DC] = 0x0F73;
-	chip->ram[0x00DD] = 0x0FA4;
+	chip->ram[OFS_ADPCM_BANK + 0x00] = 0x8000;
+	chip->ram[OFS_ADPCM_BANK + 0x04] = 0x8000;
+	chip->ram[OFS_ADPCM_BANK + 0x08] = 0x8000;
+	chip->ram[OFS_FIR1_LPOS] = 0x0F73;
+	chip->ram[OFS_FIR2_LPOS] = 0x0FA4;
+	chip->ram[OFS_FIR1_RPOS] = 0x0F73;
+	chip->ram[OFS_FIR2_RPOS] = 0x0FA4;
 	
-	dsp_copy_filter_data_2(chip);
+	dsp_copy_mode2_fir_data(chip);
 	chip->dspRtStep = 4;
 	chip->updateFunc = dsp_update_delay;	// simulate the DSP being busy for 4 samples
 	return;
 }
 
-static void dsp_filter_recalc(QSOUND_CHIP* chip, UINT16 refreshFlagAddr)	// ROM: 05DD / 099B
+static void dsp_recalculate_delay(QSOUND_CHIP* chip, UINT16 refreshFlagAddr)	// ROM: 05DD / 099B
 {
-	// Note: Subroutines 05DD and 099B are identical, except for a varying amount of NOPs at the end of the routine.
+	// Note: Subroutines 05DD and 099B are identical, except for a varying amount of NOPs at the end of the routines.
 	UINT8 curFilter;
 	UINT16 temp;
 	
 	for (curFilter = 0; curFilter < 4; curFilter ++)
 	{
-		temp = chip->ram[0x0125 + curFilter * 2] - chip->ram[0x00DE + curFilter];
+		temp = chip->ram[OFS_WET_LBUF_W + curFilter * 2] - chip->ram[OFS_WET_LDELAY + curFilter];
 		if (temp < 301 + curFilter * 51)
 			temp += 51;
-		chip->ram[0x0126 + curFilter * 2] = temp;
+		chip->ram[OFS_WET_LBUF_R + curFilter * 2] = temp;
 	}
 	
 	chip->ram[refreshFlagAddr] = 0;
 	return;
 }
 
-static void dsp_update_1(QSOUND_CHIP* chip)	// ROM: 0314
+static void dsp_update_mode_1(QSOUND_CHIP* chip)	// ROM: 0314
 {
 	if (chip->dspRtStep < 3)
-		dsp_filter_a(chip, chip->dspRtStep - 0);
+		dsp_update_adpcm(chip, chip->dspRtStep - 0, 0);
 	else
-		dsp_filter_b(chip, chip->dspRtStep - 3);
+		dsp_update_adpcm(chip, chip->dspRtStep - 3, 1);
 	dsp_sample_calc_1(chip);
 	
 	chip->dspRtStep ++;
@@ -610,13 +687,12 @@ static void dsp_update_1(QSOUND_CHIP* chip)	// ROM: 0314
 	return;
 }
 
-static void dsp_update_2(QSOUND_CHIP* chip)	// ROM: 06B2
+static void dsp_update_mode_2(QSOUND_CHIP* chip)	// ROM: 06B2
 {
-	// filter processing is identical in both functions
 	if (chip->dspRtStep < 3)
-		dsp_filter_a(chip, chip->dspRtStep - 0);
+		dsp_update_adpcm(chip, chip->dspRtStep - 0, 0);
 	else
-		dsp_filter_b(chip, chip->dspRtStep - 3);
+		dsp_update_adpcm(chip, chip->dspRtStep - 3, 1);
 	dsp_sample_calc_2(chip);
 	
 	chip->dspRtStep ++;
@@ -628,108 +704,83 @@ static void dsp_update_2(QSOUND_CHIP* chip)	// ROM: 06B2
 	return;
 }
 
-static void dsp_filter_a(QSOUND_CHIP* chip, UINT16 i1)	// ROM: 0314/036F/03CA
+static void dsp_update_adpcm(QSOUND_CHIP* chip, UINT8 chn, UINT8 nibble)
 {
-	UINT16 i4 = i1 * 4;
+	UINT16 chn4 = chn * 4;
 	INT16 x, y, z;
 	INT32 a1;
 	INT32 p;
 	
-	if (chip->ram[0x00F1 + i1] == chip->ram[0x00CB + i4])
-		chip->ram[0x00E8 + i1] = 0;
-	// ROM 0322/037D/03D8
-	if (chip->ram[0x00D6 + i1] != 0)
+	if (! nibble)
 	{
-		chip->ram[0x011A + i1] = 0;
-		chip->ram[0x00D6 + i1] = 0;
-		chip->ram[0x00EB + i1] = 0x000A;
-		chip->ram[0x00E8 + i1] = chip->ram[0x00CD + i4];
-		chip->ram[0x00F1 + i1] = chip->ram[0x00CA + i4];
+		// process high nibble
+		// ROM: 0314/036F/03CA
+		if (chip->ram[OFS_ADPCM_CUR_ADDR + chn] == chip->ram[OFS_ADPCM_END_ADDR + chn4])
+			chip->ram[OFS_ADPCM_CUR_VOL + chn] = 0;
+		// ROM 0322/037D/03D8
+		if (chip->ram[OFS_ADPCM_CH_PLAY + chn] != 0)
+		{
+			chip->ram[OFS_ACH_SMPLDATA + chn] = 0;
+			chip->ram[OFS_ADPCM_CH_PLAY + chn] = 0;
+			chip->ram[OFS_ADPCM_SIGNAL + chn] = 0x000A;
+			chip->ram[OFS_ADPCM_CUR_VOL + chn] = chip->ram[OFS_ADPCM_VOLUME + chn4];
+			chip->ram[OFS_ADPCM_CUR_ADDR + chn] = chip->ram[OFS_ADPCM_ST_ADDR + chn4];
+		}
+		// ROM: 0333/038E/03E9
+		//chip->ram[OFS_ADPCM_CUR_ADDR + chn] = chip->ram[OFS_ADPCM_CUR_ADDR + chn];
+		x = dsp_get_sample(chip, chip->ram[OFS_ADPCM_BANK + chn4], chip->ram[OFS_ADPCM_CUR_ADDR + chn]);
+		x = (INT16)(x << 0) >> 12;	// high nibble of high byte, sign-extended
 	}
-	// ROM: 0333/038E/03E9
-	//chip->ram[0x00F1 + i1] = chip->ram[0x00F1 + i1];
-	x = dsp_get_sample(chip, chip->ram[0x00CC + i4], chip->ram[0x00F1 + i1]);
-	chip->ram[0x00F4 + i1] = x >> 12;	// top nibble of x, sign-extended
-	p = (INT16)chip->ram[0x00F4 + i1] * (INT16)chip->ram[0x00EB + i1];
-	z = (INT16)chip->ram[0x00EB + i1] >> 1;
-	// ROM 034A/03A5/0400
+	else
+	{
+		// process low nibble
+		// ROM: 0425/0470/04B4
+		x = dsp_get_sample(chip, chip->ram[OFS_ADPCM_BANK + chn4], chip->ram[OFS_ADPCM_CUR_ADDR + chn]);
+		chip->ram[OFS_ADPCM_CUR_ADDR + chn] ++;
+		x = (INT16)(x << 4) >> 12;	// low nibble of high byte, sign-extended
+	}
+	chip->ram[OFS_ADPCM_STEP + chn] = x;
+	p = x * (INT16)chip->ram[OFS_ADPCM_SIGNAL + chn];
+	z = (INT16)chip->ram[OFS_ADPCM_SIGNAL + chn] >> 1;
+	// ROM 034A/03A5/0400/0447/0492/04DD
 	if (p <= 0)
 		z = -z;
-	a1 = chip->ram[0x011A + i1] + p;
-	x = chip->ram[0x00E8 + i1];
+	a1 = chip->ram[OFS_ACH_SMPLDATA + chn] + p;
+	x = chip->ram[OFS_ADPCM_CUR_VOL + chn];
 	y = a1 + z;
 	p = x * y;
-	chip->ram[0x011A + i1] = p >> 16;
-	// ROM: 0354/03AF/040A
-	x = LUT_09DC[0x08 + (INT16)chip->ram[0x00F4 + i1]];
-	p = x * (INT16)chip->ram[0x00EB + i1];
+	chip->ram[OFS_ACH_SMPLDATA + chn] = p >> 16;
+	// ROM: 0354/03AF/040A/0451/049C/04E7
+	x = LUT_ADPCM_SHIFT[0x08 + (INT16)chip->ram[OFS_ADPCM_STEP + chn]];
+	p = x * (INT16)chip->ram[OFS_ADPCM_SIGNAL + chn];
 	y = (p << 10) >> 16;
 	if (y <= 1)
 		y = 1;
 	else if (y >= 2000)
 		y = 2000;
-	chip->ram[0x00EB + i1] = y;
+	chip->ram[OFS_ADPCM_SIGNAL + chn] = y;
 	
 	return;
 }
 
-static void dsp_filter_b(QSOUND_CHIP* chip, UINT16 i1)	// ROM: 0425/0470/04B4
+static void dsp_update_pcm(QSOUND_CHIP* chip)	// ROM: 050A/08A8
 {
-	UINT16 i4 = i1 * 4;
-	INT16 x, y, z;
-	INT32 a1;
-	INT32 p;
-	
-	x = dsp_get_sample(chip, chip->ram[0x00CC + i4], chip->ram[0x00F1 + i1]);
-	chip->ram[0x00F1 + i1] ++;
-	x = (x >> 8) & 0x0F;
-	chip->ram[0x00F4 + i1] = x;
-	p = x * (INT16)chip->ram[0x00EB + i1];
-	z = (INT16)chip->ram[0x00EB + i1] >> 1;
-	// ROM 0447/0492/04DD
-	if (p <= 0)
-		z = -z;
-	a1 = chip->ram[0x011A + i1] + p;
-	x = chip->ram[0x00E8 + i1];
-	y = a1 + z;
-	p = x * y;
-	chip->ram[0x011A + i1] = p >> 16;
-	// ROM: 0451/049C/04E7
-	x = LUT_09DC[0x08 + (INT16)chip->ram[0x00F4 + i1]];
-	p = x * (INT16)chip->ram[0x00EB + i1];
-	y = (p << 10) >> 16;
-	if (y <= 1)
-		y = 1;
-	else if (y >= 2000)
-		y = 2000;
-	chip->ram[0x00EB + i1] = y;
-	
-	return;
-}
-
-static void dsp_sample_calc_1(QSOUND_CHIP* chip)	// ROM: 0504
-{
-	INT16 x, y;
-	INT32 a0, a1;
 	INT32 p;
 	UINT8 curChn;
 	UINT16 curBank;
 	UINT16 chnBase;
-	UINT16 tmpOfs, tmpOf2;
+	INT64 addr;
 	
-	// ROM: 050A
 	curBank = chip->ram[0x0078 + OFS_CH_BANK];
 	for (curChn = 0, chnBase = OFS_CHANNEL_MEM; curChn < 16; curChn ++, chnBase += 0x08)
 	{
-		INT64 addr;
-		
 		p = (INT16)chip->ram[chnBase + OFS_CH_VOLUME] * dsp_get_sample(chip, curBank, chip->ram[chnBase + OFS_CH_CUR_ADDR]);
 		chip->ram[OFS_CH_SMPLDATA + curChn] = p >> 14;	// p*4 >> 16
 		
 		curBank = chip->ram[chnBase + OFS_CH_BANK];
 		addr = chip->ram[chnBase + OFS_CH_RATE] << 4;
 		addr += ((INT16)chip->ram[chnBase + OFS_CH_CUR_ADDR] << 16) | (chip->ram[chnBase + OFS_CH_FRAC] << 0);
-		if ((UINT16)(addr >> 16) >= chip->ram[chnBase + OFS_CH_END_ADDR])
+		if ((addr >> 16) >= (INT16)chip->ram[chnBase + OFS_CH_END_ADDR])
 			addr -= (chip->ram[chnBase + OFS_CH_LOOP_LEN] << 16);
 		// The DSP's a0/a1 registers are 36 bits. The result is clamped when writing it back to RAM.
 		if (addr > 0x7FFFFFFFLL)
@@ -740,6 +791,19 @@ static void dsp_sample_calc_1(QSOUND_CHIP* chip)	// ROM: 0504
 		chip->ram[chnBase + OFS_CH_CUR_ADDR] = (addr >> 16) & 0xFFFF;
 	}
 	
+	return;
+}
+
+static void dsp_sample_calc_1(QSOUND_CHIP* chip)	// ROM: 0504
+{
+	INT16 x, y;
+	INT32 a0, a1;
+	INT32 p;
+	UINT8 curChn;
+	UINT16 tmpOfs;
+	
+	dsp_update_pcm(chip);	// ROM: 050A
+	
 	// ROM: 051E
 	a1 = 0;
 	for (curChn = 0; curChn < 16; curChn ++)
@@ -749,23 +813,23 @@ static void dsp_sample_calc_1(QSOUND_CHIP* chip)	// ROM: 0504
 	}
 	tmpOfs = chip->ram[OFS_DELAYBUF_POS] & 0x7FF;
 	a0 = (INT16)chip->ram[tmpOfs];
-	chip->ram[0x0122] = a0;
-	a0 += (INT16)chip->ram[0x0122];	// need 17 bits here
-	a0 >>= 1;
+	y = (INT16)chip->ram[OFS_REVERB_LASTSAMP];
+	chip->ram[OFS_REVERB_LASTSAMP] = a0;
+	a0 = (a0 + y) >> 1;	// Note: addition has a 17-bit result
 	y = a0;
-	x = (INT16)chip->ram[OFS_REVERB_VOL];
-	chip->ram[0x0121] = y;
+	x = (INT16)chip->ram[OFS_REVERB_FB_VOL];
+	chip->ram[OFS_REVERB_OUTPUT] = y;
 	p = x * y;
 	a1 += (p * 4);
 	chip->ram[tmpOfs] = a1 >> 16;
-	INC_MODULO(&tmpOfs, OFS_M1_DELAY_BUFFER, chip->ram[OFS_DELAYBUF_END]);
+	INC_MODULO(&tmpOfs, OFS_M1_DELAY_BUF, chip->ram[OFS_DELAYBUF_END]);
 	chip->ram[OFS_DELAYBUF_POS] = tmpOfs;
 	
 	// ROM: 0538
-	tmpOfs = chip->ram[0x0120] & 0x7FF;
+	tmpOfs = chip->ram[OFS_REV_OUTBUF_POS] & 0x7FF;
 	chip->ram[tmpOfs] = a0;
-	INC_MODULO(&tmpOfs, OFS_M1_BUF_373, OFS_M1_DELAY_BUFFER - 1);
-	chip->ram[0x0120] = tmpOfs;
+	INC_MODULO(&tmpOfs, OFS_M1_REV_OUTBUF, OFS_M1_DELAY_BUF - 1);
+	chip->ram[OFS_REV_OUTBUF_POS] = tmpOfs;
 	
 	// ---- Note: The DSP program processes external commands here. ---
 	chip->busyState = 0;
@@ -780,12 +844,12 @@ static void dsp_sample_calc_1(QSOUND_CHIP* chip)	// ROM: 0504
 		panPos = chip->ram[OFS_PAN_POS + curChn];
 		a0 -= p*4;
 		p = x * y;
-		y = chip->ram[OFS_CH_SMPLDATA + curChn];
+		y = (INT16)chip->ram[OFS_CH_SMPLDATA + curChn];
 		x = PAN_TABLES[PANTBL_LEFT_OUTPUT][panPos - 0x110];
 		
 		a1 -= p*4;
 		p = x * y;
-		y = chip->ram[OFS_CH_SMPLDATA + curChn];
+		y = (INT16)chip->ram[OFS_CH_SMPLDATA + curChn];
 		x = PAN_TABLES[PANTBL_LEFT_FILTER][panPos - 0x110];
 		
 		chip->ram[OFS_PAN_RPOS + curChn] = panPos + 98 * 2;
@@ -793,60 +857,10 @@ static void dsp_sample_calc_1(QSOUND_CHIP* chip)	// ROM: 0504
 	a0 -= p*4;
 	p = x * y;
 	a1 -= p*4;
-	a0 += (INT16)chip->ram[0x0121] << 16;
-	chip->ram[0x011E] = a0 >> 16;
+	a0 += (INT16)chip->ram[OFS_REVERB_OUTPUT] << 16;
+	chip->ram[OFS_RAW_OUT] = a0 >> 16;
 	
-	// ROM: 0572
-	tmpOf2 = OFS_M1_FILTER1_TBL;
-	tmpOfs = chip->ram[0x0123] & 0x7FF;
-	a0 = 0; p = 0;
-	x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-	y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_M1_BUF_1F9, OFS_M1_BUF_257 - 1);
-	for (curChn = 0; curChn < 93; curChn ++)
-	{
-		a0 -= p*4;
-		p = x * y;
-		x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-		y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_M1_BUF_1F9, OFS_M1_BUF_257 - 1);
-	}
-	a0 -= p*4;
-	p = x * y;
-	x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-	y = a1 >> 16;
-	a0 -= p*4;
-	p = x * y;
-	chip->ram[tmpOfs] = y;	INC_MODULO(&tmpOfs, OFS_M1_BUF_1F9, OFS_M1_BUF_257 - 1);
-	chip->ram[0x0123] = tmpOfs;
-	
-	// ROM: 0582
-	a0 -= p*4;
-	x = (INT16)chip->ram[0x00E4];
-	tmpOfs = chip->ram[0x0125] & 0x7FF;
-	chip->ram[tmpOfs] = a0 >> 16;	INC_MODULO(&tmpOfs, OFS_BUF_12D, OFS_BUF_160 - 1);
-	chip->ram[0x0125] = tmpOfs;
-	
-	tmpOfs = chip->ram[0x0126] & 0x7FF;
-	y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_BUF_12D, OFS_BUF_160 - 1);
-	p = x * y;
-	x = (INT16)chip->ram[0x00E5];
-	a0 = p*4;
-	y = (INT16)chip->ram[0x011E];
-	chip->ram[0x0126] = tmpOfs;
-	
-	tmpOfs = chip->ram[0x0127] & 0x7FF;
-	chip->ram[tmpOfs] = y;	INC_MODULO(&tmpOfs, OFS_BUF_160, OFS_BUF_193 - 1);
-	chip->ram[0x0127] = tmpOfs;
-	
-	tmpOfs = chip->ram[0x0128] & 0x7FF;
-	y = chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_BUF_160, OFS_BUF_193 - 1);
-	chip->ram[0x0128] = tmpOfs;
-	p = x * y;
-	y = (INT16)chip->ram[tmpOfs];
-	x = LUT_09D2[0];
-	a0 += p*4;
-	p = x * y;
-	a0 = DSP_ROUND(a0);
-	chip->out[0] = a0 >> 16;
+	dsp_sample_speaker_calc_1(chip, 0, a1);
 	
 	// ---- right channel ----
 	// ROM: 059D
@@ -870,63 +884,13 @@ static void dsp_sample_calc_1(QSOUND_CHIP* chip)	// ROM: 0504
 	a0 -= p*4;
 	p = x * y;
 	a1 -= p*4;
-	a1 += (INT16)chip->ram[0x0121] << 16;
-	chip->ram[0x011E] = a0 >> 16;
+	a1 += (INT16)chip->ram[OFS_REVERB_OUTPUT] << 16;
+	chip->ram[OFS_RAW_OUT] = a0 >> 16;
 	
-	// ROM: 05A9
-	tmpOf2 = OFS_M1_FILTER2_TBL;
-	tmpOfs = chip->ram[0x0124] & 0x7FF;
-	a0 = 0; p = 0;
-	x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-	y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_M1_BUF_257, OFS_M1_FILTER1_TBL - 1);
-	for (curChn = 0; curChn < 93; curChn ++)
-	{
-		a0 -= p*4;
-		p = x * y;
-		x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-		y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_M1_BUF_257, OFS_M1_FILTER1_TBL - 1);
-	}
-	a0 -= p*4;
-	p = x * y;
-	x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-	y = a1 >> 16;
-	a0 -= p*4;
-	p = x * y;
-	chip->ram[tmpOfs] = y;	INC_MODULO(&tmpOfs, OFS_M1_BUF_257, OFS_M1_FILTER1_TBL - 1);
-	chip->ram[0x0124] = tmpOfs;
+	dsp_sample_speaker_calc_1(chip, 1, a1);
 	
-	// ROM: 05BA
-	a0 -= p*4;
-	x = (INT16)chip->ram[0x00E6];
-	tmpOfs = chip->ram[0x0129] & 0x7FF;
-	chip->ram[tmpOfs] = a0 >> 16;	INC_MODULO(&tmpOfs, OFS_BUF_193, OFS_BUF_1C6 - 1);
-	chip->ram[0x0129] = tmpOfs;
-	
-	tmpOfs = chip->ram[0x012A] & 0x7FF;
-	y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_BUF_193, OFS_BUF_1C6 - 1);
-	p = x * y;
-	x = (INT16)chip->ram[0x00E7];
-	a0 = p*4;
-	y = (INT16)chip->ram[0x011E];
-	chip->ram[0x012A] = tmpOfs;
-	
-	tmpOfs = chip->ram[0x012B] & 0x7FF;
-	chip->ram[tmpOfs] = y;	INC_MODULO(&tmpOfs, OFS_BUF_1C6, OFS_M1_BUF_1F9 - 1);
-	chip->ram[0x012B] = tmpOfs;
-	
-	tmpOfs = chip->ram[0x012C] & 0x7FF;
-	y = chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_BUF_1C6, OFS_M1_BUF_1F9 - 1);
-	chip->ram[0x012C] = tmpOfs;
-	p = x * y;
-	y = (INT16)chip->ram[tmpOfs];
-	x = LUT_09D2[0];
-	a0 += p*4;
-	p = x * y;
-	a0 = DSP_ROUND(a0);
-	chip->out[1] = a0 >> 16;
-	
-	if (chip->ram[OFS_FILTER_REFRESH])
-		dsp_filter_recalc(chip, OFS_FILTER_REFRESH);
+	if (chip->ram[OFS_DELAY_REFRESH])
+		dsp_recalculate_delay(chip, OFS_DELAY_REFRESH);
 	
 	return;
 }
@@ -937,32 +901,9 @@ static void dsp_sample_calc_2(QSOUND_CHIP* chip)	// ROM: 08A2
 	INT32 a0, a1;
 	INT32 p;
 	UINT8 curChn;
-	UINT16 curBank;
-	UINT16 chnBase;
-	UINT16 tmpOfs, tmpOf2;
+	UINT16 tmpOfs;
 	
-	// ROM: 08A8
-	curBank = chip->ram[0x0078 + OFS_CH_BANK];
-	for (curChn = 0, chnBase = OFS_CHANNEL_MEM; curChn < 16; curChn ++, chnBase += 0x08)
-	{
-		INT64 addr;
-		
-		p = (INT16)chip->ram[chnBase + OFS_CH_VOLUME] * dsp_get_sample(chip, curBank, chip->ram[chnBase + OFS_CH_CUR_ADDR]);
-		chip->ram[OFS_CH_SMPLDATA + curChn] = p >> 14;	// p*4 >> 16
-		
-		curBank = chip->ram[chnBase + OFS_CH_BANK];
-		addr = chip->ram[chnBase + OFS_CH_RATE] << 4;
-		addr += ((INT16)chip->ram[chnBase + OFS_CH_CUR_ADDR] << 16) | (chip->ram[chnBase + OFS_CH_FRAC] << 0);
-		if ((UINT16)(addr >> 16) >= chip->ram[chnBase + OFS_CH_END_ADDR])
-			addr -= (chip->ram[chnBase + OFS_CH_LOOP_LEN] << 16);
-		// The DSP's a0/a1 registers are 36 bits. The result is clamped when writing it back to RAM.
-		if (addr > 0x7FFFFFFFLL)
-			addr = 0x7FFFFFFFLL;
-		else if (addr < -0x80000000LL)
-			addr = -0x80000000LL;
-		chip->ram[chnBase + OFS_CH_FRAC] = (addr >> 0) & 0xFFFF;
-		chip->ram[chnBase + OFS_CH_CUR_ADDR] = (addr >> 16) & 0xFFFF;
-	}
+	dsp_update_pcm(chip);	// ROM: 08A8
 	
 	// ROM: 08BC
 	a1 = 0;
@@ -973,23 +914,23 @@ static void dsp_sample_calc_2(QSOUND_CHIP* chip)	// ROM: 08A2
 	}
 	tmpOfs = chip->ram[OFS_DELAYBUF_POS] & 0x7FF;
 	a0 = (INT16)chip->ram[tmpOfs];
-	chip->ram[0x0122] = a0;
-	a0 += (INT16)chip->ram[0x0122];	// need 17 bits here
-	a0 >>= 1;
+	y = (INT16)chip->ram[OFS_REVERB_LASTSAMP];
+	chip->ram[OFS_REVERB_LASTSAMP] = a0;
+	a0 = (a0 + y) >> 1;	// Note: addition has a 17-bit result
 	y = a0;
-	x = (INT16)chip->ram[OFS_REVERB_VOL];
-	chip->ram[0x0121] = y;
+	x = (INT16)chip->ram[OFS_REVERB_FB_VOL];
+	chip->ram[OFS_REVERB_OUTPUT] = y;
 	p = x * y;
 	a1 += (p * 4);
 	chip->ram[tmpOfs] = a1 >> 16;
-	INC_MODULO(&tmpOfs, OFS_M2_DELAY_BUFFER, chip->ram[OFS_DELAYBUF_END]);
+	INC_MODULO(&tmpOfs, OFS_M2_DELAY_BUF, chip->ram[OFS_DELAYBUF_END]);
 	chip->ram[OFS_DELAYBUF_POS] = tmpOfs;
 	
 	// ROM: 08D6
-	tmpOfs = chip->ram[0x0120] & 0x7FF;
+	tmpOfs = chip->ram[OFS_REV_OUTBUF_POS] & 0x7FF;
 	chip->ram[tmpOfs] = a0;
-	INC_MODULO(&tmpOfs, OFS_M2_BUF_35B, OFS_M2_DELAY_BUFFER - 1);
-	chip->ram[0x0120] = tmpOfs;
+	INC_MODULO(&tmpOfs, OFS_M2_REV_OUTBUF, OFS_M2_DELAY_BUF - 1);
+	chip->ram[OFS_REV_OUTBUF_POS] = tmpOfs;
 	
 	// ---- Note: The DSP program processes external commands here. ---
 	chip->busyState = 0;
@@ -1004,12 +945,12 @@ static void dsp_sample_calc_2(QSOUND_CHIP* chip)	// ROM: 08A2
 		panPos = chip->ram[OFS_PAN_POS + curChn];
 		a0 -= p*4;
 		p = x * y;
-		y = chip->ram[OFS_CH_SMPLDATA + curChn];
+		y = (INT16)chip->ram[OFS_CH_SMPLDATA + curChn];
 		x = PAN_TABLES[PANTBL_LEFT_OUTPUT][panPos - 0x110];
 		
 		a1 -= p*4;
 		p = x * y;
-		y = chip->ram[OFS_CH_SMPLDATA + curChn];
+		y = (INT16)chip->ram[OFS_CH_SMPLDATA + curChn];
 		x = PAN_TABLES[PANTBL_LEFT_FILTER][panPos - 0x110];
 		
 		chip->ram[OFS_PAN_RPOS + curChn] = panPos + 98 * 2;
@@ -1017,82 +958,10 @@ static void dsp_sample_calc_2(QSOUND_CHIP* chip)	// ROM: 08A2
 	a0 -= p*4;
 	p = x * y;
 	a1 -= p*4;
-	a0 += (INT16)chip->ram[0x0121] << 16;
-	chip->ram[0x011E] = a0 >> 16;
+	a0 += (INT16)chip->ram[OFS_REVERB_OUTPUT] << 16;
+	chip->ram[OFS_RAW_OUT] = a0 >> 16;
 	
-	// ROM: 0910
-	tmpOf2 = OFS_M2_FILTER1A_TBL;
-	tmpOfs = chip->ram[0x0123] & 0x7FF;
-	a0 = 0; p = 0;
-	x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-	y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_M2_BUF_1FB, OFS_M2_BUF_227 - 1);
-	for (curChn = 0; curChn < 43; curChn ++)
-	{
-		a0 -= p*4;
-		p = x * y;
-		x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-		y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_M2_BUF_1FB, OFS_M2_BUF_227 - 1);
-	}
-	a0 -= p*4;
-	p = x * y;
-	x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-	y = a1 >> 16;
-	a0 -= p*4;
-	p = x * y;
-	a0 -= p*4;
-	chip->ram[tmpOfs] = y;	INC_MODULO(&tmpOfs, OFS_M2_BUF_1FB, OFS_M2_BUF_227 - 1);
-	chip->ram[0x0123] = tmpOfs;
-	
-	// ROM: 0921
-	tmpOfs = chip->ram[0x01F9] & 0x7FF;
-	a1 = 0; p = 0;
-	x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-	y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_M2_BUF_253, OFS_M2_BUF_27E - 1);
-	for (curChn = 0; curChn < 42; curChn ++)
-	{
-		a1 -= p*4;
-		p = x * y;
-		x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-		y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_M2_BUF_253, OFS_M2_BUF_27E - 1);
-	}
-	a1 -= p*4;
-	p = x * y;
-	x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-	y = (INT16)chip->ram[0x011E];
-	a1 -= p*4;
-	p = x * y;
-	chip->ram[tmpOfs] = y;	INC_MODULO(&tmpOfs, OFS_M2_BUF_253, OFS_M2_BUF_27E - 1);
-	chip->ram[0x01F9] = tmpOfs;
-	
-	// ROM: 0930
-	a1 -= p*4;
-	x = (INT16)chip->ram[0x00E4];
-	tmpOfs = chip->ram[0x0125] & 0x7FF;
-	chip->ram[tmpOfs] = a0 >> 16;	INC_MODULO(&tmpOfs, OFS_BUF_12D, OFS_BUF_160 - 1);
-	chip->ram[0x0125] = tmpOfs;
-	
-	tmpOfs = chip->ram[0x0126] & 0x7FF;
-	y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_BUF_12D, OFS_BUF_160 - 1);
-	p = x * y;
-	x = (INT16)chip->ram[0x00E5];
-	a0 = p*4;
-	y = (INT16)chip->ram[0x011E];
-	chip->ram[0x0126] = tmpOfs;
-	
-	tmpOfs = chip->ram[0x0127] & 0x7FF;
-	chip->ram[tmpOfs] = a1 >> 16;	INC_MODULO(&tmpOfs, OFS_BUF_160, OFS_BUF_193 - 1);
-	chip->ram[0x0127] = tmpOfs;
-	
-	tmpOfs = chip->ram[0x0128] & 0x7FF;
-	y = chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_BUF_160, OFS_BUF_193 - 1);
-	chip->ram[0x0128] = tmpOfs;
-	p = x * y;
-	y = (INT16)chip->ram[tmpOfs];
-	x = LUT_09D2[0];
-	a0 += p*4;
-	p = x * y;
-	a0 = DSP_ROUND(a0);
-	chip->out[0] = a0 >> 16;
+	dsp_sample_speaker_calc_2(chip, 0, a1);
 	
 	// ---- right channel ----
 	// ROM: 094B
@@ -1116,21 +985,166 @@ static void dsp_sample_calc_2(QSOUND_CHIP* chip)	// ROM: 08A2
 	a0 -= p*4;
 	p = x * y;
 	a1 -= p*4;
-	a1 += (INT16)chip->ram[0x0121] << 16;
-	chip->ram[0x011E] = a0 >> 16;
+	a1 += (INT16)chip->ram[OFS_REVERB_OUTPUT] << 16;
+	chip->ram[OFS_RAW_OUT] = a0 >> 16;
 	
-	// ROM: 0957
-	tmpOf2 = OFS_M2_FILTER2A_TBL;
-	tmpOfs = chip->ram[0x0124] & 0x7FF;
+	dsp_sample_speaker_calc_2(chip, 1, a1);
+	
+	if (chip->ram[OFS_DELAY_REFRESH])
+		dsp_recalculate_delay(chip, OFS_DELAY_REFRESH);
+	
+	return;
+}
+
+static void dsp_sample_speaker_calc_1(QSOUND_CHIP* chip, UINT8 spkr, INT32 a1)	// ROM: 0572/05A9
+{
+	UINT8 spkr2 = spkr * 2;
+	UINT8 spkr4 = spkr * 4;
+	UINT16 OFS_FIR_TBL;
+	UINT16 OFS_FIR_BUF;
+	UINT16 OFS_FIR_BEND;
+	UINT16 OFS_WET_BUF;
+	UINT16 OFS_WET_BEND;
+	UINT16 OFS_DRY_BUF;
+	UINT16 OFS_DRY_BEND;
+	INT16 x, y;
+	INT32 a0;
+	INT32 p;
+	UINT16 tmpOfs, tmpOf2;
+	UINT8 firStep;
+	
+	if (! spkr)
+	{
+		OFS_FIR_TBL = OFS_M1_FIR_LTBL;
+		OFS_FIR_BUF = OFS_M1_FIR_LBUF;
+		OFS_FIR_BEND = OFS_M1_FIR_RBUF - 1;
+		OFS_WET_BUF = OFS_WET_LBUF;
+		OFS_WET_BEND = OFS_WET_LBEND;
+		OFS_DRY_BUF = OFS_DRY_LBUF;
+		OFS_DRY_BEND = OFS_DRY_LBEND;
+	}
+	else
+	{
+		OFS_FIR_TBL = OFS_M1_FIR_RTBL;
+		OFS_FIR_BUF = OFS_M1_FIR_RBUF;
+		OFS_FIR_BEND = OFS_M1_FIR_LTBL - 1;
+		OFS_WET_BUF = OFS_WET_RBUF;
+		OFS_WET_BEND = OFS_WET_RBEND;
+		OFS_DRY_BUF = OFS_DRY_RBUF;
+		OFS_DRY_BEND = OFS_DRY_RBEND;
+	}
+	
+	// ROM: 0572/05A9
+	tmpOf2 = OFS_FIR_TBL;
+	tmpOfs = chip->ram[OFS_FIR_LBPOS + spkr] & 0x7FF;
 	a0 = 0; p = 0;
 	x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-	y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_M2_BUF_227, OFS_M2_BUF_253 - 1);
-	for (curChn = 0; curChn < 93; curChn ++)
+	y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_FIR_BUF, OFS_FIR_BEND);
+	for (firStep = 0; firStep < 93; firStep ++)
 	{
 		a0 -= p*4;
 		p = x * y;
 		x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-		y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_M2_BUF_227, OFS_M2_BUF_253 - 1);
+		y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_FIR_BUF, OFS_FIR_BEND);
+	}
+	a0 -= p*4;
+	p = x * y;
+	x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
+	y = a1 >> 16;
+	a0 -= p*4;
+	p = x * y;
+	chip->ram[tmpOfs] = y;	INC_MODULO(&tmpOfs, OFS_FIR_BUF, OFS_FIR_BEND);
+	chip->ram[OFS_FIR_LBPOS + spkr] = tmpOfs;
+	
+	// ROM: 0582/05BA
+	a0 -= p*4;
+	x = (INT16)chip->ram[OFS_WET_LVOL + spkr2];
+	tmpOfs = chip->ram[OFS_WET_LBUF_W + spkr4] & 0x7FF;
+	chip->ram[tmpOfs] = a0 >> 16;	INC_MODULO(&tmpOfs, OFS_WET_BUF, OFS_WET_BEND);
+	chip->ram[OFS_WET_LBUF_W + spkr4] = tmpOfs;
+	
+	tmpOfs = chip->ram[OFS_WET_LBUF_R + spkr4] & 0x7FF;
+	y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_WET_BUF, OFS_WET_BEND);
+	p = x * y;
+	x = (INT16)chip->ram[OFS_DRY_LVOL + spkr2];
+	a0 = p*4;
+	y = (INT16)chip->ram[OFS_RAW_OUT];
+	chip->ram[OFS_WET_LBUF_R + spkr4] = tmpOfs;
+	
+	tmpOfs = chip->ram[OFS_DRY_LBUF_W + spkr4] & 0x7FF;
+	chip->ram[tmpOfs] = y;	INC_MODULO(&tmpOfs, OFS_DRY_BUF, OFS_DRY_BEND);
+	chip->ram[OFS_DRY_LBUF_W + spkr4] = tmpOfs;
+	
+	tmpOfs = chip->ram[OFS_DRY_LBUF_R + spkr4] & 0x7FF;
+	y = chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_DRY_BUF, OFS_DRY_BEND);
+	chip->ram[OFS_DRY_LBUF_R + spkr4] = tmpOfs;
+	p = x * y;
+	y = (INT16)chip->ram[tmpOfs];
+	x = LUT_09D2[0];
+	a0 += p*4;
+	p = x * y;
+	a0 = DSP_ROUND(a0);
+	chip->out[spkr] = a0 >> 16;
+	
+	return;
+}
+
+static void dsp_sample_speaker_calc_2(QSOUND_CHIP* chip, UINT8 spkr, INT32 a1)	// ROM: 0910/0957
+{
+	UINT8 spkr2 = spkr * 2;
+	UINT8 spkr4 = spkr * 4;
+	UINT16 OFS_FIR_TBL;
+	UINT16 OFS_FIR1_BUF;
+	UINT16 OFS_FIR1_BEND;
+	UINT16 OFS_FIR2_BUF;
+	UINT16 OFS_FIR2_BEND;
+	UINT16 OFS_WET_BUF;
+	UINT16 OFS_WET_BEND;
+	UINT16 OFS_DRY_BUF;
+	UINT16 OFS_DRY_BEND;
+	INT16 x, y;
+	INT32 a0;
+	INT32 p;
+	UINT16 tmpOfs, tmpOf2;
+	UINT8 firStep;
+	
+	if (! spkr)
+	{
+		OFS_FIR_TBL = OFS_M2_FIR1_LTBL;
+		OFS_FIR1_BUF = OFS_M2_FIR1_LBUF;
+		OFS_FIR1_BEND = OFS_M2_FIR1_RBUF - 1;
+		OFS_FIR2_BUF = OFS_M2_FIR2_LBUF;
+		OFS_FIR2_BEND = OFS_M2_FIR2_RBUF - 1;
+		OFS_WET_BUF = OFS_WET_LBUF;
+		OFS_WET_BEND = OFS_WET_LBEND;
+		OFS_DRY_BUF = OFS_DRY_LBUF;
+		OFS_DRY_BEND = OFS_DRY_LBEND;
+	}
+	else
+	{
+		OFS_FIR_TBL = OFS_M2_FIR1_RTBL;
+		OFS_FIR1_BUF = OFS_M2_FIR1_RBUF;
+		OFS_FIR1_BEND = OFS_M2_FIR2_LBUF - 1;
+		OFS_FIR2_BUF = OFS_M2_FIR2_RBUF;
+		OFS_FIR2_BEND = OFS_M2_FIR1_LTBL - 1;
+		OFS_WET_BUF = OFS_WET_RBUF;
+		OFS_WET_BEND = OFS_WET_RBEND;
+		OFS_DRY_BUF = OFS_DRY_RBUF;
+		OFS_DRY_BEND = OFS_DRY_RBEND;
+	}
+	
+	// ROM: 0910/0957
+	tmpOf2 = OFS_FIR_TBL;
+	tmpOfs = chip->ram[OFS_FIR_LBPOS + spkr] & 0x7FF;
+	a0 = 0; p = 0;
+	x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
+	y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_FIR1_BUF, OFS_FIR1_BEND);
+	for (firStep = 0; firStep < 43; firStep ++)
+	{
+		a0 -= p*4;
+		p = x * y;
+		x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
+		y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_FIR1_BUF, OFS_FIR1_BEND);
 	}
 	a0 -= p*4;
 	p = x * y;
@@ -1139,62 +1153,59 @@ static void dsp_sample_calc_2(QSOUND_CHIP* chip)	// ROM: 08A2
 	a0 -= p*4;
 	p = x * y;
 	a0 -= p*4;
-	chip->ram[tmpOfs] = y;	INC_MODULO(&tmpOfs, OFS_M2_BUF_227, OFS_M2_BUF_253 - 1);
-	chip->ram[0x0124] = tmpOfs;
+	chip->ram[tmpOfs] = y;	INC_MODULO(&tmpOfs, OFS_FIR1_BUF, OFS_FIR1_BEND);
+	chip->ram[OFS_FIR_LBPOS + spkr] = tmpOfs;
 	
-	// ROM: 0969
-	tmpOfs = chip->ram[0x01FA] & 0x7FF;
+	// ROM: 0921/0969
+	tmpOfs = chip->ram[OFS_M2_FIR2_LBPOS + spkr] & 0x7FF;
 	a1 = 0; p = 0;
 	x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-	y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_M2_BUF_27E, 0x02A9 - 1);
-	for (curChn = 0; curChn < 42; curChn ++)
+	y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_FIR2_BUF, OFS_FIR2_BEND);
+	for (firStep = 0; firStep < 42; firStep ++)
 	{
 		a1 -= p*4;
 		p = x * y;
 		x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-		y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_M2_BUF_27E, 0x02A9 - 1);
+		y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_FIR2_BUF, OFS_FIR2_BEND);
 	}
 	a1 -= p*4;
 	p = x * y;
 	x = (INT16)chip->ram[tmpOf2];	tmpOf2 ++;
-	y = (INT16)chip->ram[0x011E];
+	y = (INT16)chip->ram[OFS_RAW_OUT];
 	a1 -= p*4;
 	p = x * y;
-	chip->ram[tmpOfs] = y;	INC_MODULO(&tmpOfs, OFS_M2_BUF_27E, 0x02A9 - 1);
-	chip->ram[0x01FA] = tmpOfs;
+	chip->ram[tmpOfs] = y;	INC_MODULO(&tmpOfs, OFS_FIR2_BUF, OFS_FIR2_BEND);
+	chip->ram[OFS_M2_FIR2_LBPOS + spkr] = tmpOfs;
 	
-	// ROM: 0978
+	// ROM: 0930/0978
 	a1 -= p*4;
-	x = (INT16)chip->ram[0x00E6];
-	tmpOfs = chip->ram[0x0129] & 0x7FF;
-	chip->ram[tmpOfs] = a0 >> 16;	INC_MODULO(&tmpOfs, OFS_BUF_193, OFS_BUF_1C6 - 1);
-	chip->ram[0x0129] = tmpOfs;
+	x = (INT16)chip->ram[OFS_WET_LVOL + spkr2];
+	tmpOfs = chip->ram[OFS_WET_LBUF_W + spkr4] & 0x7FF;
+	chip->ram[tmpOfs] = a0 >> 16;	INC_MODULO(&tmpOfs, OFS_WET_BUF, OFS_WET_BEND);
+	chip->ram[OFS_WET_LBUF_W + spkr4] = tmpOfs;
 	
-	tmpOfs = chip->ram[0x012A] & 0x7FF;
-	y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_BUF_193, OFS_BUF_1C6 - 1);
+	tmpOfs = chip->ram[OFS_WET_LBUF_R + spkr4] & 0x7FF;
+	y = (INT16)chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_WET_BUF, OFS_WET_BEND);
 	p = x * y;
-	x = (INT16)chip->ram[0x00E7];
+	x = (INT16)chip->ram[OFS_DRY_LVOL + spkr2];
 	a0 = p*4;
-	y = (INT16)chip->ram[0x011E];
-	chip->ram[0x012A] = tmpOfs;
+	y = (INT16)chip->ram[OFS_RAW_OUT];
+	chip->ram[OFS_WET_LBUF_R + spkr4] = tmpOfs;
 	
-	tmpOfs = chip->ram[0x012B] & 0x7FF;
-	chip->ram[tmpOfs] = a1 >> 16;	INC_MODULO(&tmpOfs, OFS_BUF_1C6, OFS_M1_BUF_1F9 - 1);
-	chip->ram[0x012B] = tmpOfs;
+	tmpOfs = chip->ram[OFS_DRY_LBUF_W + spkr4] & 0x7FF;
+	chip->ram[tmpOfs] = a1 >> 16;	INC_MODULO(&tmpOfs, OFS_DRY_BUF, OFS_DRY_BEND);
+	chip->ram[OFS_DRY_LBUF_W + spkr4] = tmpOfs;
 	
-	tmpOfs = chip->ram[0x012C] & 0x7FF;
-	y = chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_BUF_1C6, OFS_M1_BUF_1F9 - 1);
-	chip->ram[0x012C] = tmpOfs;
+	tmpOfs = chip->ram[OFS_DRY_LBUF_R + spkr4] & 0x7FF;
+	y = chip->ram[tmpOfs];	INC_MODULO(&tmpOfs, OFS_DRY_BUF, OFS_DRY_BEND);
+	chip->ram[OFS_DRY_LBUF_R + spkr4] = tmpOfs;
 	p = x * y;
 	y = (INT16)chip->ram[tmpOfs];
 	x = LUT_09D2[0];
 	a0 += p*4;
 	p = x * y;
 	a0 = DSP_ROUND(a0);
-	chip->out[1] = a0 >> 16;
-	
-	if (chip->ram[OFS_FILTER_REFRESH])
-		dsp_filter_recalc(chip, OFS_FILTER_REFRESH);
+	chip->out[spkr] = a0 >> 16;
 	
 	return;
 }
@@ -1243,7 +1254,7 @@ void device_reset_qsound_vb(void* info)
 	chip->dspRtStep = 0;
 	chip->updateFunc = dsp_do_update_step;
 	
-	dsp_init1(chip);
+	dsp_mode1_init(chip);
 	
 	return;
 }
