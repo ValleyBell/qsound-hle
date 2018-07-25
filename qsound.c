@@ -20,7 +20,7 @@
 
 // ============================================================================
 
-static int16_t qsound_dry_mix_table[33] = {
+static const int16_t qsound_dry_mix_table[33] = {
 	-16384,-16384,-16384,-16384,-16384,-16384,-16384,-16384,
 	-16384,-16384,-16384,-16384,-16384,-16384,-16384,-16384,
 	-16384,-14746,-13107,-11633,-10486,-9175,-8520,-7209,
@@ -28,7 +28,7 @@ static int16_t qsound_dry_mix_table[33] = {
 	0
 };
 
-static int16_t qsound_wet_mix_table[33] = {
+static const int16_t qsound_wet_mix_table[33] = {
 	0,-1638,-1966,-2458,-2949,-3441,-4096,-4669,
 	-4915,-5120,-5489,-6144,-7537,-8831,-9339,-9830,
 	-10240,-10322,-10486,-10568,-10650,-11796,-12288,-12288,
@@ -36,7 +36,7 @@ static int16_t qsound_wet_mix_table[33] = {
 	-16384
 };
 
-static int16_t qsound_linear_mix_table[33] = {
+static const int16_t qsound_linear_mix_table[33] = {
 	-16379,-16338,-16257,-16135,-15973,-15772,-15531,-15251,
 	-14934,-14580,-14189,-13763,-13303,-12810,-12284,-11729,
 	-11729,-11144,-10531,-9893,-9229,-8543,-7836,-7109,
@@ -44,7 +44,7 @@ static int16_t qsound_linear_mix_table[33] = {
 	0
 };
 
-static int16_t qsound_filter_data[5][95] = {
+static const int16_t qsound_filter_data[5][95] = {
 	{	// d53 - 0
 		0,0,0,6,44,-24,-53,-10,59,-40,-27,1,39,-27,56,127,174,36,-13,49,
 		212,142,143,-73,-20,66,-108,-117,-399,-265,-392,-569,-473,-71,95,-319,-218,-230,331,638,
@@ -82,7 +82,7 @@ static int16_t qsound_filter_data[5][95] = {
 	}
 };
 
-static int16_t qsound_filter_data2[209] = {
+static const int16_t qsound_filter_data2[209] = {
 	// f2e - following 95 values used for "disable output" filter
 	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
 	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
@@ -102,7 +102,7 @@ static int16_t qsound_filter_data2[209] = {
 	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 };
 
-static int16_t adpcm_step_table[16] = {
+static const int16_t adpcm_step_table[16] = {
 	154, 154, 128, 102, 77, 58, 58, 58,
 	58, 58, 58, 58, 77, 102, 128, 154
 };
@@ -491,7 +491,7 @@ static inline void adpcm_update(struct qsound_chip *chip, int voice_no, int nibb
 	if(!nibble)
 	{
 		// Mute voice when it reaches the end address.
-		if(v->start_addr == v->end_addr)
+		if(v->cur_addr == v->end_addr)
 			v->cur_vol = 0;
 		
 		// Playback start flag
